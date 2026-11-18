@@ -1,0 +1,1071 @@
+#!/usr/bin/env python3
+"""Rover scout client for the Hiwonder TurboPi: camera -> Osprey (same binary WS protocol as the
+phone page); dispatch/follow/stop commands -> mecanum chassis and an optional pan servo.
+
+Pan camera (--pan-call ...): the camera leads, the body follows. While locked, the pan keeps the
+target centred in the image and the body steers toward pan angle + image error; searching sweeps
+the camera with the body still and spins the body only after a full sweep; while arrived, small
+moves are followed by the pan alone. Without --pan-call the body does all the steering.
+
+Usage on the TurboPi:
+  python3 scout_client.py <url> [--node B] [--camera 0] [--hw none|hiwonder] [--onboard green|person|none]
+                          [--pan-call MODULE:FUNC --pan-id N --pan-center US --pan-sign 1|-1]
+  python3 scout_client.py --probe                       # list the SDK's servo/chassis calls (read-only)
+  python3 scout_client.py --selftest --hw hiwonder [--pan-call ...]   # short guarded moves
+  <url> is ws://169.254.50.2:8000 on the wired switch, or the https://<tunnel> URL.
+
+Dispatch flow (rover starts beside the deck camera, facing along its optical axis):
+  {"type":"dispatch","heading_deg","distance_m"} -> "turning" to the heading -> "driving": drive
+  forward until the target is recognised, for at most distance_m + EXTRA_SEARCH_M (timed, no wheel
+  encoders) -> "searching": spin slowly in place until it is recognised -> "approaching": lock on
+  to that target, turn toward it and drive until its box is big enough -> "arrived": keeps
+  following the ball if it moves (turns in place to keep it centred, drives after it when it moves
+  away). Losing the target holds position; after LOST_TO_SEARCH_S without it the rover searches.
+  Every state change is reported as {"type":"rover_state","state":...,"onboard":{...}}.
+
+Recognition: the rover's own Pi runs --onboard "green" (the ground's green/red ball classifier,
+src/osprey/perception/ballcolor.py, copied next to this file or run from the repo; red balls are
+decoys and never steer it), "person" (OpenCV HOG, CPU only) or "none". Once it sees the target it
+LOCKS on: later frames only accept the box nearest the locked one (within LOCK_GATE), so a second
+green blob cannot steal it. The onboard lock steers first; the ground's follow error (Hailo on the
+ground Pi) steers when the rover has no fresh onboard sighting. Stop always wins, and the rover
+stops whenever the link to the ground drops.
+
+Protocol: binary uint32 LE header_len | header JSON | JPEG, header {node_id, session_id, seq,
+capture_ts_ms, width, height}; clock pings {"ping": ms} -> {"pong","srv"} -> {"sync","srv","recv"}.
+Commands from the ground: {"type":"dispatch",...}, {"type":"follow","err":[ex,ey],"size"}
+(normalized box-center error and box height), {"type":"hold"}, {"type":"stop"}.
+"""
+import argparse
+import asyncio
+import atexit
+import json
+import os
+import signal
+import struct
+import sys
+import threading
+import time
+import uuid
+
+
+async def _in_thread(fn):
+    """asyncio.to_thread needs Python 3.9; older Hiwonder images may ship 3.7/3.8."""
+    if hasattr(asyncio, "to_thread"):
+        return await asyncio.to_thread(fn)
+    return await asyncio.get_event_loop().run_in_executor(None, fn)
+
+
+def _exit_on_sigterm() -> None:
+    """kill / deploy_rover.sh stop sends SIGTERM, which skips atexit and finally blocks by
+    default; turn it into a normal exit so the wheels are always stopped."""
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+from pathlib import Path
+
+
+def _load_ballcolor():
+    """Same classifier as the ground: next to this file, installed osprey, or the repo's src/."""
+    here = Path(__file__).resolve().parent
+    for p in (here, here.parent / "src"):
+        if str(p) not in sys.path:
+            sys.path.append(str(p))
+    try:
+        import ballcolor  # copied next to this file on the rover
+        return ballcolor
+    except ImportError:
+        pass
+    try:
+        from osprey.perception import ballcolor
+        return ballcolor
+    except ImportError:
+        return None
+
+
+ballcolor = _load_ballcolor()
+
+STALE_S = 1.0             # a sighting or follow error older than this does not steer
+
+# timed dead reckoning: calibrate on the floor at the venue with --selftest and a tape measure
+DRIVE_SPEED = 0.5         # fraction of max
+DRIVE_M_PER_S = 0.25      # measured ground speed at DRIVE_SPEED
+TURN_DEG_PER_S = 280.0    # venue TurboPi: ~170 deg/s at turn=0.3 (camera-measured, rough; it coasts)
+SEARCH_TURN = 0.2
+EXTRA_SEARCH_M = 1.0      # keep driving this far past the dispatch distance before spinning
+LOST_TO_SEARCH_S = 3.0    # lost target this long while approaching -> search again
+LOCK_GATE = 0.4           # max box-centre jump (fraction of frame) that still counts as the lock
+                          # (0.25 dropped good locks while the rover turned; one green ball in the demo)
+APPROACH_TURN_GAIN = 0.5  # turns ~3x faster than first assumed: was 1.2 and overshot
+APPROACH_MAX_TURN = 0.2
+APPROACH_MIN_TURN = 0.15  # below this the motors don't reliably move the body in place (0.12 stalled;
+                          # trace: 0.145 turns it). While driving, smaller yaw works (wheels already turn)
+INPLACE_BOOST_PER_S = 0.08  # turning in place this long without lining up: push harder (stall / low battery)
+INPLACE_MAX_TURN = 0.3
+APPROACH_TURN_DEADBAND = 0.05
+TURN_FRESH_S = 0.4        # only turn on a sighting this recent; blurred frames pause the turn
+PAN_HANDOFF_DEG = 10.0    # camera found the ball further off-axis than this: body turns toward
+                          # the camera's angle while the camera keeps the ball in view
+APPROACH_ALIGN_ERR = 0.35  # turn in place only when the target is further off than this (~21 deg);
+                           # inside it, drive at it and steer. 0.15 made the rover stop and turn on
+                           # every noisy frame at ~1 m (err jumps +-0.2) and it often never closed in
+APPROACH_SPEED = 0.6       # fraction of DRIVE_SPEED while approaching
+HOLD_DEADBAND = 0.08      # while arrived, turn to re-centre when the ball is off-centre by more
+REAPPROACH_FRAC = 0.85    # while arrived, drive after the ball when its box shrinks below this share
+                          # of the arrival size (0.7 let a ball ~1.4x further away sit unchased)
+ARRIVE_BOX_H = 0.85       # target box height (fraction of frame) that counts as "arrived"
+ARRIVE_BY_TARGET = {"person": 0.85, "green": 0.35, "none": 0.85}  # green: with a level camera the
+# ball slipped under the view at ~0.24 of the frame height; the tilt now follows it down
+# tilt camera (venue TurboPi: servo 2, higher pulse = down). Follows the ball down as the rover
+# closes in, and looks down for a ball that dropped out of the bottom of the frame.
+TILT_DOWN_LIMIT_US = 1500.0   # looking at the floor just in front of the chassis
+TILT_STEP_US = 50.0           # ~4.5 deg per step
+TILT_US_PER_DEG = 11.1
+TILT_LOW_Y = 0.7              # box centre below this (fraction of height): tilt down a step
+TILT_HIGH_Y = 0.35            # box centre above this: tilt back up a step (not above the start)
+TILT_LOST_Y = 0.6             # lost while this low: it went out the bottom, look down for it
+TILT_LOST_STEP_S = 0.15
+
+# pan camera (camera leads, body follows). Pan angle: 0 = straight ahead, + = right (clockwise).
+CAM_HFOV_DEG = 60.0       # measured on the venue TurboPi (upright mount, 03:45): 40 deg of pan moved the ball
+                          # ~0.68 of the width -> ~60 deg. Retail listings say 120.
+PAN_LIMIT_DEG = 80.0
+PAN_GAIN = 0.5            # fraction of the image error (in deg) corrected per tick
+PAN_MAX_STEP_DEG = 4.0    # per tick (~10 Hz)
+PAN_DEADBAND_DEG = 2.0
+PAN_SWEEP_DEG = 70.0      # search sweep half-width
+PAN_SWEEP_DEG_PER_S = 60.0
+SEARCH_SPIN_DEG = 75.0    # after a full camera sweep with nothing seen, turn the body this far to a
+                          # fresh sector (sweep +-70 deg + 60 deg FOV covers ~200 deg, so 60-90 overlaps)
+SEARCH_SPIN_TURN = 0.3    # 0.2 for 0.35 s turned the venue rover only ~10 deg
+SEARCH_SPIN_DEG_PER_S = 170.0  # measured at turn 0.3 on the venue rover (camera, rough)
+SEARCH_SPIN_LAG_S = 0.15  # motors take this long to get going from standstill
+SEARCH_SPIN_S = SEARCH_SPIN_DEG / SEARCH_SPIN_DEG_PER_S + SEARCH_SPIN_LAG_S   # ~0.6 s; --spin-s overrides
+ARRIVED_BODY_DEG = 20.0   # (unused since the body alone steers at the ball)
+ARRIVED_HOLD_ERR = 0.1    # at the ball: hold still while it is within this of centre
+# link loss (Wi-Fi drop): camera, lock, search and approach all run on the rover, so it carries on.
+# But a coordinator "stop" cannot reach it then: after this long without the ground it stops and
+# holds (--autonomy-s; 0 = stop at once, the old behaviour).
+LINK_AUTONOMY_S = 60.0
+# UWB range beacon (--uwb): one DWM3001CDK on the rover, one with the ball. Distance only, ~10 cm.
+UWB_ARRIVE_M = 0.5        # range that counts as at the ball (board offsets: calibrate with --uwb-offset)
+UWB_RUNOUT_EXTRA_M = 0.3  # with a range, run out this far past it before searching (not EXTRA_SEARCH_M)
+UWB_AWAY_M = 0.25         # range grew this much while running out: wrong way, search instead
+UWB_NEAR_M = 0.8          # closer than this and not in view: look around (sweep) rather than drive legs
+UWB_LEG_S = 1.5           # range-gradient search: drive this long blind, then compare ranges
+UWB_LEG_GAIN_M = 0.08     # a leg that shortened the range by this much was the right way
+UWB_MAX_GOOD_LEGS = 3     # after this many good legs in a row, sweep the camera again
+MOVING_STATES = ("turning", "driving", "searching", "approaching", "arrived")
+
+
+class NoHardware:
+    """Video-only scout: prints what it would do (driving not demonstrated)."""
+
+    has_pan = False
+    tilt_base_us = None
+
+    def set_pan(self, deg: float) -> None:
+        pass
+
+    def set_tilt(self, us: float) -> None:
+        pass
+
+    def drive(self, forward: float, turn: float) -> None:
+        """forward in [-1, 1] (fraction of max speed), turn in [-1, 1] (+ = clockwise)."""
+        print(f"drive forward={forward:+.2f} turn={turn:+.2f}")
+
+    def stop(self) -> None:
+        print("stop")
+
+
+# Hiwonder SDK mapping. MecanumChassis.set_velocity(speed, direction_deg, yaw_rate):
+# direction 90 = forward, 270 = backward; (0, 0, 0) stops; positive yaw = clockwise per the
+# Hiwonder mecanum chassis wiki. Speed and yaw scales differ between Hiwonder docs, so these are
+# conservative and must be checked with --selftest on the real rover.
+SDK_PATHS = ("/home/pi/TurboPi", "/home/pi/TurboPi/HiwonderSDK/..", "/home/pi")
+SDK_MAX_SPEED = 100.0     # set_velocity speed at forward = 1.0
+SDK_MAX_YAW = 1.0         # set_velocity yaw at turn = 1.0 (docs show a -2..2 range)
+SDK_YAW_SIGN = 1.0        # flip to -1 if --selftest shows the "clockwise" spin going anticlockwise
+SDK_FORWARD_DEG = 90.0
+SDK_BACKWARD_DEG = 270.0
+
+
+TRACE = os.environ.get("ROVER_TRACE") == "1"   # one log line per tick + lock decisions
+
+
+def _trace(msg: str) -> None:
+    if TRACE:
+        print(f"{time.time():.2f} {msg}", flush=True)
+
+
+def _clamp(v: float, lo: float = -1.0, hi: float = 1.0) -> float:
+    return max(lo, min(hi, v))
+
+
+def _add_sdk_paths() -> None:
+    extra = os.environ.get("TURBOPI_SDK")
+    for p in ((extra,) if extra else ()) + SDK_PATHS:
+        p = os.path.normpath(p)
+        if os.path.isdir(p) and p not in sys.path:
+            sys.path.append(p)
+
+
+class PulseServo:
+    """Pan servo driven by a Hiwonder-style call fn(servo_id, pulse_us, move_ms).
+
+    UNVERIFIED: the TurboPi's servo call is not documented publicly. Run --probe on the rover to
+    list the SDK's servo functions, then pass e.g. --pan-call HiwonderSDK.Board:setPWMServoPulse
+    --pan-id <id>. Typical hobby servos: 500-2500 us over ~180 deg (≈11.1 us/deg), 1500 = centre;
+    check centre and direction with --selftest."""
+
+    def __init__(self, fn, servo_id: int, center_us: float = 1500.0, us_per_deg: float = 11.1,
+                 sign: float = 1.0, move_ms: int = 60, limit_deg: float = PAN_LIMIT_DEG):
+        self.fn, self.servo_id = fn, servo_id
+        self.center_us, self.us_per_deg, self.sign = center_us, us_per_deg, sign
+        self.move_ms, self.limit_deg = move_ms, limit_deg
+
+    def pulse(self, deg: float) -> int:
+        deg = _clamp(deg, -self.limit_deg, self.limit_deg)
+        return int(round(self.center_us + self.sign * deg * self.us_per_deg))
+
+    def set(self, deg: float) -> None:
+        self.fn(self.servo_id, self.pulse(deg), self.move_ms)
+
+    @staticmethod
+    def resolve(spec: str):
+        """'package.module:function' -> callable, importing from the TurboPi SDK path."""
+        import importlib
+
+        _add_sdk_paths()
+        mod, _, name = spec.partition(":")
+        return getattr(importlib.import_module(mod), name)
+
+
+class HiwonderHardware(NoHardware):
+    """Mecanum chassis through HiwonderSDK.mecanum (TurboPi image), plus an optional pan servo."""
+
+    def __init__(self, chassis=None, pan: "PulseServo" = None, tilt: tuple = None):
+        """tilt: (fn, servo_id, start_us) for the camera tilt servo, or None."""
+        self.chassis = chassis if chassis is not None else self._open_chassis()
+        self.pan = pan
+        self.tilt = tilt
+        self.tilt_base_us = tilt[2] if tilt else None
+        self.last = (0.0, 0.0, 0.0)
+        atexit.register(self.stop)  # never leave the wheels turning when the client exits
+
+    def set_tilt(self, us: float) -> None:
+        if self.tilt is not None:
+            fn, sid, _ = self.tilt
+            fn(sid, int(us), 80)
+
+    @property
+    def has_pan(self) -> bool:
+        return self.pan is not None
+
+    def set_pan(self, deg: float) -> None:
+        if self.pan is not None:
+            self.pan.set(deg)
+
+    @staticmethod
+    def _open_chassis():
+        _add_sdk_paths()
+        try:
+            import HiwonderSDK.mecanum as mecanum
+        except ImportError as e:
+            raise SystemExit(
+                "HiwonderSDK not found. Find the folder containing HiwonderSDK/ on the TurboPi "
+                "(e.g. `find / -name mecanum.py -path '*Hiwonder*' 2>/dev/null`) and run with "
+                f"TURBOPI_SDK=<that folder>. ({e})")
+        return mecanum.MecanumChassis()
+
+    @staticmethod
+    def to_sdk(forward: float, turn: float) -> tuple:
+        forward, turn = _clamp(forward), _clamp(turn)
+        speed = abs(forward) * SDK_MAX_SPEED
+        direction = SDK_FORWARD_DEG if forward >= 0 else SDK_BACKWARD_DEG
+        yaw = SDK_YAW_SIGN * turn * SDK_MAX_YAW
+        return (round(speed, 1), direction, round(yaw, 3))
+
+    def drive(self, forward: float, turn: float) -> None:
+        cmd = self.to_sdk(forward, turn)
+        self.chassis.set_velocity(*cmd)
+        self.last = cmd
+
+    def stop(self) -> None:
+        self.chassis.set_velocity(0, 0, 0)
+        self.last = (0.0, 0.0, 0.0)
+
+
+class PersonHOG:
+    """OpenCV's built-in HOG + linear SVM people detector: no model files, CPU only."""
+
+    def __init__(self, width: int = 320):
+        import cv2
+
+        self.cv2 = cv2
+        self.width = width
+        self.hog = cv2.HOGDescriptor()
+        self.hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+
+    def best(self, frame):
+        cv2 = self.cv2
+        h, w = frame.shape[:2]
+        s = self.width / float(w)
+        small = cv2.resize(frame, (self.width, int(h * s)))
+        rects, weights = self.hog.detectMultiScale(small, winStride=(8, 8), padding=(8, 8), scale=1.05)
+        if len(rects) == 0:
+            return None
+        i = int(max(range(len(rects)), key=lambda k: float(weights[k])))
+        x, y, bw, bh = rects[i]
+        sh, sw = small.shape[:2]
+        conf = float(min(0.99, max(0.0, 0.5 + 0.25 * float(weights[i]))))
+        return {"bbox": (x / sw, y / sh, (x + bw) / sw, (y + bh) / sh), "confidence": conf}
+
+
+def _centre(bbox) -> tuple:
+    x1, y1, x2, y2 = bbox
+    return ((x1 + x2) / 2, (y1 + y2) / 2)
+
+
+class Rover:
+    """Dispatch state machine. tick() runs ~10 Hz."""
+
+    def __init__(self, hw, report):
+        self.hw, self.report = hw, report
+        self.state = "idle"
+        self.until = 0.0
+        self.plan = None
+        self.follow = None  # last ground follow message
+        self.follow_ts = 0.0
+        self.local = None   # locked onboard sighting, same shape as a follow message
+        self.local_ts = 0.0
+        self.lock_centre = None
+        self.decoys = 0     # red balls in the last onboard frame
+        self.guide_src = None
+        self.pan_deg = 0.0  # commanded pan angle (+ = right); stays 0 without a pan servo
+        self.tilt_us = getattr(hw, "tilt_base_us", None)   # None: no tilt servo
+        self.tilt_applied_ts = 0.0
+        self.tilt_step_ts = 0.0
+        self.last_cy = 0.5
+        self.pan_applied_ts = 0.0  # sighting time last used for a pan correction
+        self.sweep_dir = 1.0
+        self.half_sweeps = 0
+        self.spin_until = 0.0
+        self.inplace_since = None  # when the current turn-in-place began (stall boost)
+        self.uwb = None            # UwbRanger (--uwb) or None
+        self.leg_until = 0.0       # range-gradient search leg in progress until
+        self.leg_r0 = None
+        self.good_legs = 0
+        self.runout_r0 = None      # range when the run-out started
+        self.link_up = False
+        self.link_lost_at = None   # when the ground link last dropped (None: never connected)
+        self.last_tick = None
+
+    # ----------------------------------------------------------- pan camera
+    def _set_pan(self, deg: float) -> None:
+        new = _clamp(deg, -PAN_LIMIT_DEG, PAN_LIMIT_DEG)
+        if self.lock_centre is not None and new != self.pan_deg:
+            # panning right moves the ball left in the image: move the lock window with it
+            lx, ly = self.lock_centre
+            self.lock_centre = (lx - (new - self.pan_deg) / CAM_HFOV_DEG, ly)
+        self.pan_deg = new
+        self.hw.set_pan(self.pan_deg)
+
+    # ----------------------------------------------------------- tilt camera
+    def _set_tilt(self, us: float) -> None:
+        if self.tilt_us is None:
+            return
+        base = self.hw.tilt_base_us
+        new = _clamp(us, min(base, TILT_DOWN_LIMIT_US), TILT_DOWN_LIMIT_US)
+        if new == self.tilt_us:
+            return
+        if self.lock_centre is not None:
+            # tilting down moves the ball up in the image: move the lock window with it
+            lx, ly = self.lock_centre
+            self.lock_centre = (lx, ly - (new - self.tilt_us) / TILT_US_PER_DEG / (CAM_HFOV_DEG * 0.75))
+        self.tilt_us = new
+        self.hw.set_tilt(new)
+
+    def _track_tilt(self, cy: float, sighting_ts: float) -> None:
+        """Keep the ball off the bottom edge as the rover closes in; once per new sighting."""
+        self.last_cy = cy
+        if self.tilt_us is None or sighting_ts <= self.tilt_applied_ts:
+            return
+        self.tilt_applied_ts = sighting_ts
+        if cy > TILT_LOW_Y:
+            self._set_tilt(self.tilt_us + TILT_STEP_US)
+        elif cy < TILT_HIGH_Y and self.tilt_us > self.hw.tilt_base_us:
+            self._set_tilt(self.tilt_us - TILT_STEP_US)
+
+    def _look_down_if_lost_low(self, now: float) -> None:
+        """Ball vanished while low in the frame: it went out the bottom, so tilt down for it."""
+        if self.tilt_us is not None and self.last_cy > TILT_LOST_Y and \
+                self.tilt_us < TILT_DOWN_LIMIT_US and now - self.tilt_step_ts >= TILT_LOST_STEP_S:
+            self.tilt_step_ts = now
+            self._set_tilt(self.tilt_us + TILT_STEP_US)
+
+    def _track_pan(self, ex: float, sighting_ts: float) -> None:
+        """Camera leads: re-centre the target in the image, once per new sighting."""
+        if not self.hw.has_pan or sighting_ts <= self.pan_applied_ts:
+            return
+        self.pan_applied_ts = sighting_ts
+        err_deg = ex * CAM_HFOV_DEG
+        if abs(err_deg) > PAN_DEADBAND_DEG:
+            step = _clamp(PAN_GAIN * err_deg, -PAN_MAX_STEP_DEG, PAN_MAX_STEP_DEG)
+            self._set_pan(self.pan_deg + step)
+
+    @staticmethod
+    def _body_turn(b: float) -> float:
+        """Bounded body turn for bearing b (fraction of FOV): zero inside the deadband, otherwise
+        at least the turn that actually moves the chassis and at most APPROACH_MAX_TURN."""
+        if abs(b) <= APPROACH_TURN_DEADBAND:
+            return 0.0
+        mag = _clamp(APPROACH_TURN_GAIN * abs(b), APPROACH_MIN_TURN, APPROACH_MAX_TURN)
+        return mag if b > 0 else -mag
+
+    def _turn_in_place(self, b: float, now: float, fresh_turn: bool) -> None:
+        """Turn toward bearing b with the body still; the longer it has been turning in place
+        without lining up, the harder it pushes, so a stalled turn never leaves it stuck."""
+        if self.inplace_since is None:
+            self.inplace_since = now
+        if not fresh_turn:
+            self.hw.drive(0.0, 0.0)
+            return
+        turn = self._body_turn(b)
+        if turn:
+            mag = min(INPLACE_MAX_TURN, abs(turn) + INPLACE_BOOST_PER_S * (now - self.inplace_since))
+            turn = mag if turn > 0 else -mag
+        self.hw.drive(0.0, turn)
+
+    def _bearing(self, ex: float) -> float:
+        """Target direction relative to the body, as a fraction of the camera's field of view
+        (equals the image error when the camera faces straight ahead)."""
+        return (self.pan_deg + ex * CAM_HFOV_DEG) / CAM_HFOV_DEG
+
+    def _search(self, now: float, dt: float) -> None:
+        """With a pan camera: sweep it with the body still, spin the body after each full sweep.
+        Without one: spin the body."""
+        if not self.hw.has_pan:
+            self.hw.drive(0.0, SEARCH_TURN)
+            return
+        if now < self.spin_until:
+            self.hw.drive(0.0, SEARCH_SPIN_TURN)
+            return
+        if self._uwb_leg(now):
+            return
+        self.hw.stop()
+        nxt = self.pan_deg + self.sweep_dir * PAN_SWEEP_DEG_PER_S * dt
+        if abs(nxt) >= PAN_SWEEP_DEG:
+            nxt = PAN_SWEEP_DEG * self.sweep_dir
+            self.sweep_dir = -self.sweep_dir
+            self.half_sweeps += 1
+            if self.half_sweeps >= 2:  # looked both ways: turn the body to a fresh sector
+                self.half_sweeps = 0
+                nxt = 0.0
+                r = self.uwb_m(now)
+                if r is not None and r > UWB_NEAR_M:
+                    self._start_leg(now, r)   # beacon says it is further off: try this way first
+                else:
+                    self.spin_until = now + SEARCH_SPIN_S
+        self._set_pan(nxt)
+
+    def _start_leg(self, now: float, r: float) -> None:
+        self.leg_until, self.leg_r0 = now + UWB_LEG_S, r
+        self._set_pan(0.0)
+
+    def _uwb_leg(self, now: float) -> bool:
+        """Range-gradient search (ball out of view, beacon in range): drive a short leg straight,
+        keep going while the range shrinks, turn to a new sector when it does not. True while the
+        leg owns the wheels."""
+        if self.leg_r0 is None:
+            return False
+        if now < self.leg_until:
+            self.hw.drive(DRIVE_SPEED * APPROACH_SPEED, 0.0)   # camera ahead: sighting -> approach
+            return True
+        r = self.uwb_m(now)
+        r0, self.leg_r0 = self.leg_r0, None
+        self.hw.stop()
+        if r is not None and r0 - r >= UWB_LEG_GAIN_M and r > UWB_NEAR_M \
+                and self.good_legs + 1 < UWB_MAX_GOOD_LEGS:
+            self.good_legs += 1
+            self._start_leg(now, r)                 # closing in: same way again
+            _trace(f"uwb leg good {r0:.2f} -> {r:.2f} m")
+            return True
+        if r is None or r0 - r < UWB_LEG_GAIN_M:    # not closer: this way is wrong, turn
+            self.good_legs = 0
+            self.spin_until = now + SEARCH_SPIN_S
+            _trace(f"uwb leg bad {r0:.2f} -> {r if r is None else round(r, 2)} m: turn")
+            return True
+        self.good_legs = 0                          # close now, or enough legs: look around
+        return False
+
+    # ----------------------------------------------------------- recognition
+    def locked(self, now: float = None) -> bool:
+        now = time.time() if now is None else now
+        return self.lock_centre is not None and now - self.local_ts <= STALE_S
+
+    def on_local(self, targets, decoys: int = 0) -> None:
+        """Onboard result for one frame: None, one {"bbox","confidence"} box, or a list of them.
+        Unlocked: take the most confident box and lock on. Locked: only the box nearest the lock
+        (within LOCK_GATE) counts, so another green blob cannot steal the target."""
+        self.decoys = decoys
+        if targets is None:
+            _trace("det none")
+            return
+        cands = [targets] if isinstance(targets, dict) else list(targets)
+        if not cands:
+            _trace("det none")
+            return
+        now = time.time()
+        if self.locked(now):
+            lx, ly = self.lock_centre
+
+            def dist(d):
+                cx, cy = _centre(d["bbox"])
+                return ((cx - lx) ** 2 + (cy - ly) ** 2) ** 0.5
+
+            best = min(cands, key=dist)
+            if dist(best) > LOCK_GATE:
+                _trace(f"det rejected: {len(cands)} green, nearest {dist(best):.2f} from lock "
+                       f"({lx:.2f},{ly:.2f}) > gate {LOCK_GATE}")
+                return  # not our target: the lock goes stale unless it comes back
+        else:
+            best = max(cands, key=lambda d: d["confidence"])
+        cx, cy = _centre(best["bbox"])
+        x1, y1, x2, y2 = best["bbox"]
+        self.lock_centre = (cx, cy)
+        self.local = {"err": [cx - 0.5, cy - 0.5], "size": y2 - y1, "confidence": best["confidence"]}
+        self.local_ts = now
+
+    def uwb_m(self, now: float = None):
+        """Fresh UWB range to the ball's beacon in metres, or None (no --uwb, stale, unplugged)."""
+        return None if self.uwb is None else self.uwb.range_m(now)
+
+    def onboard(self) -> dict:
+        """What the rover's own camera says, reported with every state change."""
+        fresh = self.local is not None and time.time() - self.local_ts <= STALE_S
+        label = getattr(self, "onboard_label", "green")
+        r = self.uwb_m()
+        uwb_info = {} if self.uwb is None else {
+            "uwb_m": None if r is None else round(r, 2), "uwb_status": self.uwb.status}
+        return {**uwb_info, "label": label if fresh else None, "color": "green" if fresh and label == "green" else None,
+                "confidence": round(self.local["confidence"], 2) if fresh else None,
+                "decoys": self.decoys, "guide": self.guide_src, "locked": fresh,
+                "pan_deg": round(self.pan_deg, 1) if self.hw.has_pan else None,
+                "classifier": ballcolor is not None}
+
+    def _guide(self, now: float):
+        """The rover's own lock first, then the ground's follow error, else None."""
+        if self.local is not None and now - self.local_ts <= STALE_S:
+            self.guide_src = "onboard"
+            return self.local
+        if self.follow is not None and now - self.follow_ts <= STALE_S:
+            self.guide_src = "ground"
+            return self.follow
+        self.guide_src = None
+        return None
+
+    # ----------------------------------------------------------- commands
+    def set(self, state: str) -> None:
+        if state != self.state:
+            self.inplace_since = None
+            self.leg_r0 = None
+            if state == "searching" and self.tilt_us is not None:
+                self._set_tilt(self.hw.tilt_base_us)   # search at the start tilt, not at the floor
+                self.last_cy = 0.5
+            self.state = state
+            self.report(state)
+
+    def dispatch(self, plan: dict) -> None:
+        self.plan = plan
+        self.lock_centre = None  # a new dispatch starts a fresh search
+        self.half_sweeps, self.spin_until = 0, 0.0
+        self.leg_until, self.leg_r0, self.good_legs = 0.0, None, 0
+        self._set_pan(0.0)
+        if self.tilt_us is not None:
+            self._set_tilt(self.hw.tilt_base_us)   # start each run at the level-ish start tilt
+            self.last_cy = 0.5
+        turn_s = abs(plan.get("heading_deg", 0.0)) / TURN_DEG_PER_S
+        self.turn_dir = 1.0 if plan.get("heading_deg", 0.0) >= 0 else -1.0
+        self.until = time.time() + turn_s
+        self.set("turning")
+
+    def on_command(self, m: dict) -> None:
+        t = m.get("type")
+        if t == "dispatch":
+            self.dispatch(m)
+        elif t == "follow":
+            self.follow, self.follow_ts = m, time.time()
+        elif t == "stop":
+            self.follow = None
+            if self.state in MOVING_STATES:   # stop wins, at the ball too
+                self.hw.stop()
+                self.set("stopped")
+
+    def on_link(self, up: bool, now: float = None) -> None:
+        now = time.time() if now is None else now
+        if up:
+            self.link_up, self.link_lost_at = True, None
+        elif self.link_up or self.link_lost_at is None:
+            self.link_up, self.link_lost_at = False, now
+            if self.state in MOVING_STATES:
+                print(f"ground link lost while {self.state}: carrying on alone "
+                      f"(stops after {LINK_AUTONOMY_S:.0f} s without the link)", flush=True)
+
+    # ----------------------------------------------------------- control
+    def tick(self) -> None:
+        now = time.time()
+        if not self.link_up and self.link_lost_at is not None and self.state in MOVING_STATES \
+                and now - self.link_lost_at >= LINK_AUTONOMY_S:
+            self.hw.stop()                    # nobody can stop it now: stop and hold
+            self.follow = None
+            print(f"no ground link for {now - self.link_lost_at:.0f} s: stopped", flush=True)
+            self.set("stopped")
+            return
+        self._tick()
+        if TRACE:
+            g = self.local if self.guide_src == "onboard" else self.follow if self.guide_src else None
+            _trace(f"tick {self.state} src={self.guide_src} "
+                   f"err={None if not g else round(g['err'][0], 2)} size={None if not g else round(g.get('size', 0), 2)} "
+                   f"pan={self.pan_deg:.1f} cmd={getattr(self.hw, 'last', None)}")
+
+    def _tick(self) -> None:
+        now = time.time()
+        dt = 0.1 if self.last_tick is None else _clamp(now - self.last_tick, 0.0, 0.2)
+        self.last_tick = now
+        guide = self._guide(now)
+        fresh = guide is not None
+        if fresh and self.state in ("approaching", "arrived"):
+            ts = self.local_ts if self.guide_src == "onboard" else self.follow_ts
+            self._track_tilt(guide["err"][1] + 0.5, ts)
+        if self.state == "turning":
+            if now < self.until:
+                self.hw.drive(0.0, 0.5 * self.turn_dir)
+            else:
+                r = self.uwb_m(now)
+                if r is not None:      # real distance to the beacon instead of the planned guess
+                    dist = r + UWB_RUNOUT_EXTRA_M
+                    self.runout_r0 = r
+                else:
+                    dist = self.plan.get("distance_m", 1.5) + EXTRA_SEARCH_M
+                    self.runout_r0 = None
+                self.until = now + dist / DRIVE_M_PER_S
+                self.set("driving")
+        elif self.state == "driving":  # drive forward until the target is recognised
+            r = self.uwb_m(now)
+            if fresh:
+                self.set("approaching")
+            elif r is not None and (r <= UWB_NEAR_M or (
+                    self.runout_r0 is not None and r - self.runout_r0 >= UWB_AWAY_M)):
+                self.hw.stop()         # beacon is close, or we are driving away from it: search
+                self.set("searching")
+            elif now < self.until:
+                self.hw.drive(DRIVE_SPEED, 0.0)
+            else:
+                self.set("searching")
+        elif self.state == "searching":
+            if fresh:
+                self.set("approaching")
+            else:
+                self._search(now, dt)
+        elif self.state == "approaching":
+            if not fresh:
+                self.hw.stop()  # hold on visual or link loss
+                self._look_down_if_lost_low(now)
+                last = max(self.follow_ts, self.local_ts)
+                if now - last > LOST_TO_SEARCH_S:
+                    self.lock_centre = None
+                    self.set("searching")
+                return
+            b = self._bearing(guide["err"][0])
+            size = guide.get("size", 0.0)
+            r = self.uwb_m(now)
+            if size >= ARRIVE_BOX_H or (r is not None and r <= UWB_ARRIVE_M):
+                self.hw.stop()
+                self.set("arrived")
+                return
+            ts = self.local_ts if self.guide_src == "onboard" else self.follow_ts
+            fresh_turn = now - ts <= TURN_FRESH_S
+            if abs(self.pan_deg) > PAN_HANDOFF_DEG:
+                # the search sweep found it off-axis: snapping the camera back would lose it. The
+                # camera keeps the ball centred while the body turns toward it (it hands over once
+                # the pan is back near 0)
+                self._track_pan(guide["err"][0], ts)
+                b = self._bearing(guide["err"][0])
+            elif self.pan_deg != 0.0:
+                # one steerer at a time: centre the camera (the lock window follows) and let the
+                # body turn by the full bearing; pan + body together overshot and oscillated
+                self._set_pan(0.0)
+            if abs(b) > APPROACH_ALIGN_ERR:   # well off to the side: turn in place first
+                self._turn_in_place(b, now, fresh_turn)
+            else:                             # roughly ahead: always close in, steering as it goes
+                self.inplace_since = None
+                steer = 0.0 if abs(b) <= APPROACH_TURN_DEADBAND or not fresh_turn else \
+                    _clamp(APPROACH_TURN_GAIN * b, -APPROACH_MAX_TURN, APPROACH_MAX_TURN)
+                self.hw.drive(DRIVE_SPEED * APPROACH_SPEED, steer)
+        elif self.state == "arrived":  # keep following the ball if it moves
+            if not fresh:
+                self.hw.stop()
+                self._look_down_if_lost_low(now)
+                last = max(self.follow_ts, self.local_ts)
+                if now - last > LOST_TO_SEARCH_S:
+                    self.lock_centre = None
+                    self.set("searching")  # ball left the frame: look for it again
+                return
+            b = self._bearing(guide["err"][0])
+            if self.pan_deg != 0.0:
+                self._set_pan(0.0)   # one steerer at the ball too: pan + body together oscillated
+            hold = ARRIVED_HOLD_ERR
+            r = self.uwb_m(now)
+            if guide.get("size", 1.0) < ARRIVE_BOX_H * REAPPROACH_FRAC and \
+                    (r is None or r > UWB_ARRIVE_M + 0.15):
+                self.set("approaching")  # ball moved away: drive after it
+            elif abs(b) > hold:
+                ts = self.local_ts if self.guide_src == "onboard" else self.follow_ts
+                self._turn_in_place(b, now, now - ts <= TURN_FRESH_S)
+            else:
+                self.inplace_since = None
+                self.hw.stop()  # close and within the hold band: hold
+
+
+SELFTEST_S = 1.0
+
+
+def selftest(hw) -> None:
+    """Short guarded moves to confirm directions and measure speed. Lift or clear the rover."""
+    moves = [("forward", DRIVE_SPEED, 0.0), ("backward", -DRIVE_SPEED, 0.0),
+             ("spin clockwise (seen from above)", 0.0, 0.5), ("spin anticlockwise", 0.0, -0.5)]
+    try:
+        for name, f, t in moves:
+            ans = input(f"{name} for {SELFTEST_S:.0f} s? [Enter = go, s = skip, q = quit] ").strip().lower()
+            if ans == "q":
+                break
+            if ans == "s":   # skip really skips: no wheel command at all
+                continue
+            hw.drive(f, t)
+            time.sleep(SELFTEST_S)
+            hw.stop()
+        else:
+            if hw.has_pan and input("pan sweep: centre, 30 deg right, 30 deg left, centre? "
+                                    "[Enter = go, s = skip] ").strip().lower() != "s":
+                for deg in (0.0, 30.0, -30.0, 0.0):
+                    print(f"pan {deg:+.0f} deg")
+                    hw.set_pan(deg)
+                    time.sleep(SELFTEST_S)
+                print("If centre is off, adjust --pan-center; if +30 went left, pass --pan-sign -1.")
+        print("Measure distance at DRIVE_SPEED and degrees at turn=0.5 over a longer run, then set\n"
+              "DRIVE_M_PER_S / TURN_DEG_PER_S; flip SDK_YAW_SIGN if the clockwise spin went the other way.")
+    finally:
+        hw.stop()
+
+
+def probe() -> None:
+    """Read-only: where the Hiwonder SDK is and which servo/PWM/chassis functions it offers.
+    Paste the output back so the pan call can be filled in. Moves nothing."""
+    import importlib
+    import inspect
+    import pkgutil
+
+    _add_sdk_paths()
+    print("python", sys.version.split()[0], "| sys.path additions:",
+          [p for p in sys.path if "TurboPi" in p or p == "/home/pi"])
+    try:
+        pkg = importlib.import_module("HiwonderSDK")
+    except ImportError as e:
+        print("HiwonderSDK not importable:", e)
+        print("try: find / -name '*.py' -path '*Hiwonder*' 2>/dev/null | head -50")
+        return
+    print("HiwonderSDK at", getattr(pkg, "__path__", "?"))
+    keys = ("servo", "pwm", "pulse", "velocity", "motor", "pan", "tilt")
+    for info in pkgutil.iter_modules(pkg.__path__):
+        name = f"HiwonderSDK.{info.name}"
+        try:
+            mod = importlib.import_module(name)  # import only; no function is called
+        except Exception as e:  # noqa: BLE001 - some SDK modules need hardware at import
+            print(f"  {name}: import failed ({type(e).__name__}: {e})")
+            continue
+        for attr, obj in inspect.getmembers(mod):
+            if any(k in attr.lower() for k in keys) and callable(obj):
+                try:
+                    sig = str(inspect.signature(obj))
+                except (TypeError, ValueError):
+                    sig = "(?)"
+                print(f"  {name}:{attr}{sig}")
+            elif inspect.isclass(obj) and obj.__module__ == mod.__name__:
+                for m, fn in inspect.getmembers(obj, callable):
+                    if any(k in m.lower() for k in keys):
+                        try:
+                            sig = str(inspect.signature(fn))
+                        except (TypeError, ValueError):
+                            sig = "(?)"
+                        print(f"  {name}:{attr}.{m}{sig}")
+    print("video devices:", sorted(p for p in os.listdir("/dev") if p.startswith("video"))
+          if os.path.isdir("/dev") else "?")
+
+
+ROTATE_CODES = {90: "ROTATE_90_CLOCKWISE", 180: "ROTATE_180", 270: "ROTATE_90_COUNTERCLOCKWISE"}
+
+
+def ws_urls(url: str, node: str) -> list:
+    """Comma-separated server URLs, tried in order (wired first, then e.g. the Cloudflare tunnel
+    over Wi-Fi). http(s) and ws(s) both work; /ws/scout?node=X is appended."""
+    out = []
+    for u in url.split(","):
+        u = u.strip().rstrip("/")
+        if not u:
+            continue
+        if u.endswith("/scout"):          # tunnel.sh prints .../scout (the phone page)
+            u = u[: -len("/scout")]
+        u = u.replace("https://", "wss://").replace("http://", "ws://")
+        out.append(u + f"/ws/scout?node={node}")
+    return out
+
+
+CONNECT_TIMEOUT_S = 4.0   # give up on one URL quickly and try the next
+LINK_DEAD_S = 4.0         # no reply from the ground this long (it pongs every 1 s): drop the link.
+                          # The library keepalive can sit behind sends blocked on a pulled cable
+                          # for minutes (seen: 220 s), so the rover watches replies itself.
+VISION_PERIOD_S = 0.1     # onboard detection rate, independent of the video sent
+
+
+async def run(url: str, cam_index: int, hw, node: str = "B", fps: float = 10.0,
+              onboard: str = "green", rotate: int = 0, jpeg_q: int = 70, uwb=None):
+    import cv2
+    import websockets
+
+    global ARRIVE_BOX_H, CAM_HFOV_DEG
+    rot = getattr(cv2, ROTATE_CODES[rotate]) if rotate in ROTATE_CODES else None
+    if rotate in (90, 270):  # portrait after rotation: across the image is the camera's vertical FOV
+        CAM_HFOV_DEG = CAM_HFOV_DEG * 0.75
+    ARRIVE_BOX_H = ARRIVE_BY_TARGET.get(onboard, ARRIVE_BOX_H)
+    person = PersonHOG() if onboard == "person" else None
+    cap = cv2.VideoCapture(cam_index)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    # the camera runs faster than we process: a reader thread keeps only the newest frame, so the
+    # controller never steers on a queued, seconds-old image
+    latest = {"f": None, "n": 0}
+
+    def reader():
+        while True:
+            ok_, f_ = cap.read()
+            if ok_:
+                latest["f"], latest["n"] = f_, latest["n"] + 1
+            else:
+                time.sleep(0.02)
+    threading.Thread(target=reader, daemon=True).start()
+    used = [0]
+    outbox: list = []
+    rover = Rover(hw, lambda st: outbox.append({"type": "rover_state", "state": st,
+                                                "onboard": rover.onboard()}))
+    rover.onboard_label = onboard
+    rover.uwb = uwb
+    if onboard == "green" and ballcolor is None:
+        print("onboard classifier unavailable (ballcolor.py not found): ground guidance only")
+    n = [0]
+
+    def grab():
+        t_end = time.time() + 0.5
+        while latest["n"] == used[0] and time.time() < t_end:
+            time.sleep(0.005)
+        used[0] = latest["n"]
+        frame = latest["f"]
+        ok = frame is not None
+        if ok and rot is not None:  # upright before the onboard lock and the ground both see it
+            frame = cv2.rotate(frame, rot)
+        n[0] += 1
+        if ok and person is not None and n[0] % 2 == 0:  # HOG every other frame (~5 Hz)
+            rover.on_local(person.best(frame))
+        elif ok and onboard == "green" and ballcolor is not None:
+            res = ballcolor.find_balls(frame)
+            rover.on_local(res.get("greens", res["target"]), len(res["decoys"]))
+        return ok, frame
+    shown = {"frame": None, "ts": 0.0, "n": 0}   # newest processed frame, for the ground
+
+    async def vision():
+        """Camera + onboard lock, link or no link (~10 Hz, as the controller was tuned)."""
+        while True:
+            t0 = time.time()
+            ok, frame = await _in_thread(grab)
+            if ok:
+                shown["frame"], shown["ts"], shown["n"] = frame, time.time() * 1000, shown["n"] + 1
+            await asyncio.sleep(max(0.0, VISION_PERIOD_S - (time.time() - t0)) if ok else 0.2)
+
+    async def control():
+        last_uwb_report = 0.0
+        while True:
+            rover.tick()
+            if rover.uwb is not None and time.time() - last_uwb_report >= 1.0:
+                last_uwb_report = time.time()
+                rover.report(rover.state)   # live range for the dashboard (same state again)
+            del outbox[:-20]   # link down: keep only the newest reports
+            await asyncio.sleep(0.1)
+
+    background = [asyncio.create_task(vision()), asyncio.create_task(control())]  # noqa: F841
+    session = "turbopi-" + uuid.uuid4().hex[:6]
+    seq = 0
+    urls = ws_urls(url, node)
+    if not urls:
+        raise SystemExit("no server URL")
+    k = 0
+    period = 1.0 / fps
+    while True:
+        ws_url = urls[k % len(urls)]
+        try:
+            async with websockets.connect(ws_url, max_size=None, ping_interval=5,
+                                          open_timeout=CONNECT_TIMEOUT_S) as ws:
+                print("connected", ws_url, flush=True)
+                rover.on_link(True)
+                rover.report(rover.state)   # tell the ground where the rover got to meanwhile
+
+                last_rx = [time.time()]
+
+                async def receiver():
+                    async for msg in ws:
+                        last_rx[0] = time.time()
+                        m = json.loads(msg)
+                        if "pong" in m:
+                            await ws.send(json.dumps({"sync": m["pong"], "srv": m["srv"], "recv": time.time() * 1000}))
+                        elif m.get("type") in ("follow", "hold", "stop", "dispatch"):
+                            rover.on_command(m)
+
+                async def pinger():
+                    while True:
+                        await ws.send(json.dumps({"ping": time.time() * 1000}))
+                        await asyncio.sleep(1.0)
+
+                async def sender():
+                    nonlocal seq
+                    sent_n, last_t = 0, 0.0
+                    while True:
+                        while outbox:
+                            await ws.send(json.dumps(outbox.pop(0)))
+                        if shown["n"] != sent_n and time.time() - last_t >= period:
+                            sent_n, last_t = shown["n"], time.time()
+                            frame, ts = shown["frame"], shown["ts"]
+                            h, w = frame.shape[:2]
+                            ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, jpeg_q])
+                            if ok:
+                                seq += 1
+                                hdr = json.dumps({"node_id": node, "session_id": session, "seq": seq,
+                                                  "capture_ts_ms": ts, "width": w, "height": h}).encode()
+                                await ws.send(struct.pack("<I", len(hdr)) + hdr + jpg.tobytes())
+                        await asyncio.sleep(0.03)
+
+                async def watchdog():
+                    while time.time() - last_rx[0] < LINK_DEAD_S:
+                        await asyncio.sleep(0.5)
+                    raise ConnectionError(f"no reply from the ground for {LINK_DEAD_S:.0f} s")
+
+                tasks = [asyncio.create_task(c()) for c in (receiver, pinger, sender, watchdog)]
+                try:
+                    done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                    for t in done:
+                        if t.exception():
+                            raise t.exception()
+                    raise ConnectionError("connection closed")
+                finally:
+                    for t in tasks:
+                        t.cancel()
+                    if time.time() - last_rx[0] >= LINK_DEAD_S:
+                        # dead link: drop the socket now; a close handshake would wait on it
+                        tr = getattr(ws, "transport", None)
+                        if tr is not None:
+                            tr.abort()
+        except Exception as e:  # noqa: BLE001
+            # the rover keeps searching/approaching on its own camera (control() above), and
+            # stops by itself after LINK_AUTONOMY_S without the ground
+            rover.on_link(False)
+            if LINK_AUTONOMY_S <= 0:
+                hw.stop()
+            k += 1     # next URL (wired -> tunnel -> wired ...)
+            nxt = urls[k % len(urls)]
+            print(f"link error on {ws_url}: {e} - trying {nxt} in 1 s", flush=True)
+            await asyncio.sleep(1.0)
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("url", nargs="?", help="server URL, or several comma-separated, tried in order: "
+                    "ws://169.254.50.2:8000,https://xxx.trycloudflare.com")
+    ap.add_argument("--node", default="B")
+    ap.add_argument("--camera", type=int, default=0)
+    # venue TurboPi: camera remounted upright (landscape) at 03:40; 270 undoes a 90 deg clockwise mount
+    ap.add_argument("--rotate", type=int, default=0, choices=[0, 90, 180, 270],
+                    help="clockwise degrees applied to every frame (270 = undo a 90 deg clockwise mount)")
+    ap.add_argument("--hw", default="none", choices=["none", "hiwonder"])
+    ap.add_argument("--onboard", default="green", choices=["person", "green", "none"])
+    ap.add_argument("--selftest", action="store_true", help="guarded chassis/pan moves, no network")
+    ap.add_argument("--probe", action="store_true", help="list the Hiwonder SDK's servo/chassis calls; moves nothing")
+    ap.add_argument("--pan-call", default="auto", help="pan servo call fn(id, pulse_us, ms); auto = "
+                    "HiwonderSDK.Board:setPWMServoPulse with --hw hiwonder; none = no pan (body steers)")
+    # verified on the venue TurboPi (Pi 5 image): servo 1 pans, servo 2 tilts; pulse 1167 (lower)
+    # turned the camera to the rover's right, so +deg (right) needs pan-sign -1
+    ap.add_argument("--pan-id", type=int, default=1)
+    ap.add_argument("--pan-center", type=float, default=1500.0, help="pulse (us) that points straight ahead")
+    ap.add_argument("--pan-us-per-deg", type=float, default=11.1)
+    ap.add_argument("--tilt-id", type=int, default=2, help="tilt servo (venue TurboPi: 2)")
+    # venue TurboPi (upright mount): lower pulse = camera up; 1200-1500 point at the floor,
+    # 800-900 is about level; 1000 (slightly down) keeps a close ball in frame on arrival
+    ap.add_argument("--tilt-us", type=float, default=1000.0, help="tilt pulse set at start; 0 = leave it")
+    ap.add_argument("--spin-deg", type=float, default=SEARCH_SPIN_DEG,
+                    help="body turn between camera sweeps while searching (timed, no encoders)")
+    ap.add_argument("--spin-s", type=float, default=0.0,
+                    help="override: spin duration in seconds (0 = from --spin-deg and the measured rate)")
+    ap.add_argument("--autonomy-s", type=float, default=LINK_AUTONOMY_S,
+                    help="keep searching/approaching this long after the ground link drops, then stop "
+                         "(0 = stop at once)")
+    ap.add_argument("--uwb", default="", help="UWB range beacon port (/dev/ttyACM0, or auto); off by default")
+    ap.add_argument("--uwb-init", default="", help="command sent when the port opens, e.g. INITF (Qorvo CLI)")
+    ap.add_argument("--uwb-offset", type=float, default=0.0, help="metres subtracted from every range "
+                    "(board-to-ball and board-to-camera offsets)")
+    ap.add_argument("--uwb-arrive", type=float, default=UWB_ARRIVE_M, help="range that counts as arrived")
+    ap.add_argument("--fps", type=float, default=10.0, help="video sent to the ground (Wi-Fi/tunnel: try 6-8)")
+    ap.add_argument("--jpeg-q", type=int, default=70, help="JPEG quality of the video sent (tunnel: try 55)")
+    ap.add_argument("--trace", action="store_true", help="log every control tick and lock decision")
+    ap.add_argument("--pan-sign", type=float, default=-1.0, choices=[1.0, -1.0])
+    a = ap.parse_args()
+    global TRACE, SEARCH_SPIN_S
+    globals()["LINK_AUTONOMY_S"] = a.autonomy_s
+    TRACE = TRACE or a.trace
+    SEARCH_SPIN_S = a.spin_s if a.spin_s > 0 else a.spin_deg / SEARCH_SPIN_DEG_PER_S + SEARCH_SPIN_LAG_S
+    print(f"search spin: {SEARCH_SPIN_S:.2f} s at turn {SEARCH_SPIN_TURN} (~{a.spin_deg:.0f} deg)")
+    _exit_on_sigterm()
+    if a.probe:
+        probe()
+        return
+    pan = None
+    if a.pan_call == "auto":
+        a.pan_call = "HiwonderSDK.Board:setPWMServoPulse" if a.hw == "hiwonder" else ""
+    if a.pan_call == "none":
+        a.pan_call = ""
+    if a.pan_call:
+        pan = PulseServo(PulseServo.resolve(a.pan_call), a.pan_id, a.pan_center,
+                         a.pan_us_per_deg, a.pan_sign)
+    if pan is not None and a.hw != "hiwonder":
+        ap.error("--pan-call needs --hw hiwonder")
+    tilt = (pan.fn, a.tilt_id, a.tilt_us) if pan is not None and a.tilt_us > 0 else None
+    hw = HiwonderHardware(pan=pan, tilt=tilt) if a.hw == "hiwonder" else NoHardware()
+    if a.hw == "hiwonder" and tilt is not None:
+        hw.set_tilt(a.tilt_us)   # camera at the start tilt, pan centred
+        pan.set(0.0)
+    if a.selftest:
+        selftest(hw)
+        return
+    if not a.url:
+        ap.error("url is required unless --selftest")
+    try:
+        ranger = None
+        if a.uwb:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import uwb as uwb_mod
+            globals()["UWB_ARRIVE_M"] = a.uwb_arrive
+            ranger = uwb_mod.UwbRanger(a.uwb, init_cmd=a.uwb_init or None, offset_m=a.uwb_offset).start()
+            print(f"uwb: reading {a.uwb} (init {a.uwb_init or '-'}, offset {a.uwb_offset} m, "
+                  f"arrive at {a.uwb_arrive} m)", flush=True)
+        asyncio.run(run(a.url, a.camera, hw, a.node, fps=a.fps, onboard=a.onboard, rotate=a.rotate,
+                        jpeg_q=a.jpeg_q, uwb=ranger))
+    finally:
+        hw.stop()
+
+
+if __name__ == "__main__":
+    main()
